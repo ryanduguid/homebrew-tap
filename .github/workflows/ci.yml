@@ -35,6 +35,7 @@ jobs:
       - name: Tap local checkout
         run: |
           brew tap ryanduguid/tap "$GITHUB_WORKSPACE"
+          brew trust ryanduguid/tap
 
       - name: Audit formula
         run: |
