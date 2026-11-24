@@ -71,16 +71,44 @@ jobs:
             brew audit --strict --formula "ryanduguid/tap/$name"
             install_flags=(--verbose)
             need_source=true
-            if grep -qE '^\s*bottle do$' "Formula/${name}.rb"; then
-              bottle_urls="$(brew info --json=v2 "ryanduguid/tap/$name" | python3 -c 'import json,sys; d=json.load(sys.stdin)["formulae"][0]; files=d.get("bottle",{}).get("stable",{}).get("files",{}); print("\n".join(v.get("url","") for v in files.values() if v.get("url")))')"
+            if grep -qE '^[[:space:]]*bottle do$' "Formula/${name}.rb"; then
+              bottle_info="$(brew info --json=v2 "ryanduguid/tap/$name")"
+              bottle_urls="$(BOTTLE_INFO="$bottle_info" python3 - <<'PY'
+          import json, os, platform
+          d = json.loads(os.environ["BOTTLE_INFO"])["formulae"][0]
+          files = d.get("bottle", {}).get("stable", {}).get("files", {})
+          sysname = platform.system()
+          arch = platform.machine().lower()
+          def compat(tag):
+              if tag == "all":
+                  return True
+              if sysname == "Linux":
+                  return tag == ("arm64_linux" if arch in ("arm64", "aarch64") else "x86_64_linux")
+              if sysname == "Darwin":
+                  if tag.endswith("_linux"):
+                      return False
+                  if arch in ("arm64", "aarch64"):
+                      return tag.startswith("arm64_")
+                  return not tag.startswith("arm64_")
+              return True
+          for k, v in files.items():
+              if compat(k) and v.get("url"):
+                  print(v["url"])
+          PY
+          )"
               if [ -n "$bottle_urls" ]; then
                 need_source=false
                 while IFS= read -r b_url; do
                   [ -n "$b_url" ] || continue
-                  code="$(curl -s -o /dev/null -w '%{http_code}' -I --max-time 10 "$b_url" || echo 000)"
-                  if [ "$code" != "200" ] && [ "$code" != "302" ]; then
+                  code="$(curl -sS -L -r 0-0 -o /dev/null -w '%{http_code}' --retry 2 --retry-delay 1 --max-time 15 "$b_url" || true)"
+                  if [ "$code" = "200" ] || [ "$code" = "206" ]; then
+                    continue
+                  elif [ "$code" = "404" ] || [ "$code" = "410" ]; then
                     need_source=true
                     break
+                  else
+                    echo "Unexpected HTTP ${code:-000} probing bottle URL $b_url" >&2
+                    exit 1
                   fi
                 done <<< "$bottle_urls"
               fi

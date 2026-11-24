@@ -5,6 +5,10 @@ on:
     branches: [main]
     paths: ["Formula/*.rb"]
 
+concurrency:
+  group: publish-bottles
+  cancel-in-progress: false
+
 permissions: {}
 
 jobs:
@@ -40,6 +44,11 @@ jobs:
               if not m_root:
                   continue
               tag = m_root.group(1)
+              formula_name = rb.stem
+              prefix = f"bottles-{formula_name}-"
+              if not tag.startswith(prefix):
+                  raise SystemExit(f"{rb}: unexpected bottle root_url tag {tag} for {formula_name}")
+              version = tag.removeprefix(prefix)
               digests = dict(re.findall(r'sha256\s+(?:cellar:\s+:\w+,\s+)?([a-z0-9_]+):\s+"([0-9a-f]{64})"', text))
               if not digests:
                   raise SystemExit(f"{rb}: bottle root_url {tag} found without sha256 digests")
@@ -54,9 +63,9 @@ jobs:
               }
               mismatches = []
               for os_tag, want_sha in digests.items():
-                  matched = any(want_sha == got_sha and f".{os_tag}.bottle." in aname for aname, got_sha in asset_digests.items())
-                  if not matched:
-                      mismatches.append((os_tag, want_sha))
+                  expected_name = f"{formula_name}-{version}.{os_tag}.bottle.tar.gz"
+                  if asset_digests.get(expected_name) != want_sha:
+                      mismatches.append((expected_name, want_sha))
               if mismatches:
                   raise SystemExit(f"{tag}: digest mismatch against release assets: {mismatches}")
               if rel.get("isDraft"):
@@ -64,6 +73,9 @@ jobs:
               else:
                   print(f"{tag}: already published and verified")
 
+          # GitHub Releases lacks multi-release transactions; all referenced releases
+          # are preflighted above under workflow concurrency, and failed promotions
+          # can be safely re-run idempotently without --clobber.
           for tag in to_publish:
               subprocess.check_call(["gh", "release", "edit", tag, "--draft=false"])
               print(f"Published immutable bottle release {tag}")

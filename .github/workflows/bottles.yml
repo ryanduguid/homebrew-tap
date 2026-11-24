@@ -9,6 +9,10 @@ on:
         default: "all"
         type: string
 
+concurrency:
+  group: bottles-stage
+  cancel-in-progress: false
+
 permissions: {}
 
 jobs:
@@ -228,8 +232,20 @@ jobs:
                   if a.get("state") == "uploaded"
               }
               if got_digests != want_digests:
-                  raise SystemExit(f"Existing draft release {tag} assets/digests do not match this build; delete the stale draft before rerunning.")
-              print(f"Reusing matching intact draft release {tag}")
+                  # Unpublished drafts are safe to replace without touching any published release.
+                  print(f"Replacing incomplete/stale draft release {tag}")
+                  version = tag.removeprefix(f"bottles-{name}-")
+                  subprocess.check_call(["gh", "release", "delete", tag, "--yes"])
+                  subprocess.check_call([
+                      "gh", "release", "create", tag,
+                      *(str(p) for p in sorted(out.iterdir())),
+                      "--draft",
+                      "--target", target_sha,
+                      "--title", f"Bottles for {name} {version}",
+                      "--notes", f"Prebuilt Homebrew bottles for {name} {version} (staged draft; published upon PR merge).",
+                  ])
+              else:
+                  print(f"Reusing matching intact draft release {tag}")
           PY
 
             brew bottle --merge --write --no-commit --keep-old "${jsons[@]}"
@@ -251,7 +267,7 @@ jobs:
             echo "No formula changes to commit."
             exit 0
           fi
-          branch="ryan/bottles-${INPUT_FORMULA}-${GITHUB_RUN_ID}"
+          branch="ryan/bottles-${INPUT_FORMULA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           git checkout -b "$branch"
           git add Formula/
           git commit -m "Update Homebrew bottles for ${INPUT_FORMULA}"
