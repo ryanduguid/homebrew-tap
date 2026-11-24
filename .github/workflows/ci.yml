@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test-formulae:
     strategy:
@@ -16,10 +20,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Configure Homebrew on Linux
@@ -37,15 +42,34 @@ jobs:
           brew tap ryanduguid/tap "$GITHUB_WORKSPACE"
           brew trust ryanduguid/tap
 
-      - name: Audit, install and test every formula
+      - name: Audit, install and test changed or all formulae
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          for f in Formula/*.rb; do
-            name="$(basename "$f" .rb)"
+          formulae=()
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$BASE_SHA" ]; then
+            if git diff --quiet "$BASE_SHA" HEAD -- .github/workflows/ci.yml; then
+              while IFS= read -r path; do
+                [ -f "$path" ] && formulae+=("$(basename "$path" .rb)")
+              done < <(git diff --name-only "$BASE_SHA" HEAD -- 'Formula/*.rb')
+            fi
+          fi
+          if [ "${#formulae[@]}" -eq 0 ]; then
+            for f in Formula/*.rb; do
+              formulae+=("$(basename "$f" .rb)")
+            done
+          fi
+          for name in "${formulae[@]}"; do
             echo "=== Auditing $name ==="
             brew audit --strict --formula "ryanduguid/tap/$name"
-            echo "=== Installing $name ==="
-            brew install --verbose "ryanduguid/tap/$name"
+            install_flags=(--verbose)
+            if ! grep -q "bottle do" "Formula/${name}.rb"; then
+              install_flags+=(--build-from-source)
+            fi
+            echo "=== Installing $name (${install_flags[*]}) ==="
+            brew install "${install_flags[@]}" "ryanduguid/tap/$name"
             echo "=== Testing $name ==="
             brew test "ryanduguid/tap/$name"
           done

@@ -4,12 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       formula:
-        description: "Formula name (ozzit or australian-tax-calculators)"
+        description: "Formula name matching Formula/<name>.rb"
         required: true
-        type: choice
-        options:
-          - ozzit
-          - australian-tax-calculators
+        type: string
       version:
         description: "New upstream version without leading v (e.g. 3.9.0)"
         required: true
@@ -35,12 +32,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.TAP_PR_TOKEN || secrets.GITHUB_TOKEN }}
           persist-credentials: true
 
       - name: Update formula and open PR
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.TAP_PR_TOKEN || secrets.GITHUB_TOKEN }}
           FORMULA: ${{ inputs.formula }}
           VERSION: ${{ inputs.version }}
           URL: ${{ inputs.url }}
@@ -50,11 +47,13 @@ jobs:
           python3 - <<'PY'
           import os, pathlib, re, sys
 
-          formula = os.environ["FORMULA"]
+          formula = os.environ["FORMULA"].strip()
           version = os.environ["VERSION"].strip()
           url = os.environ["URL"].strip()
           sha256 = os.environ["SHA256"].strip().lower()
 
+          if not re.fullmatch(r"[a-z0-9-]+", formula) or not (pathlib.Path("Formula") / f"{formula}.rb").is_file():
+              sys.exit(f"unknown formula: {formula}")
           if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*", version):
               sys.exit(f"invalid version: {version}")
           if not re.fullmatch(r"https://github\.com/ryanduguid/[^\s\"']+", url):
@@ -68,20 +67,20 @@ jobs:
           text, n_sha = re.subn(r'^  sha256 "[0-9a-f]{64}"$', f'  sha256 "{sha256}"', text, count=1, flags=re.M)
           if n_url != 1 or n_sha != 1:
               sys.exit(f"expected 1 url and 1 sha256 in {path}, got {n_url} and {n_sha}")
-          # Remove stale bottles from the prior version so CI rebuilds cleanly.
           text = re.sub(r'\n  bottle do\n(?:.*\n)*?  end\n', '\n', text)
           path.write_text(text, encoding="utf-8", newline="\n")
           PY
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          branch="bump/${FORMULA}-${VERSION}"
+          branch="ryan/bump-${FORMULA}-${VERSION}"
           git checkout -b "$branch"
           git add "Formula/${FORMULA}.rb"
           git commit -m "Bump ${FORMULA} to ${VERSION}"
-          git push origin "$branch"
+          git push origin "refs/heads/${branch}"
           gh pr create \
             --base main \
             --head "$branch" \
+            --draft \
             --title "Bump ${FORMULA} to ${VERSION}" \
-            --body "Updates \`Formula/${FORMULA}.rb\` to ${VERSION} and clears stale bottle digests. Run the \`Build and publish Homebrew bottles\` workflow after merging."
+            --body "Updates \`Formula/${FORMULA}.rb\` to ${VERSION} and clears stale bottle digests. Run \`Build and publish Homebrew bottles\` if prebuilt bottles are desired."

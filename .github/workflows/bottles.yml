@@ -4,20 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       formula:
-        description: "Formula name to bottle (ozzit, australian-tax-calculators or all)"
+        description: "Formula name to bottle, or 'all'"
         required: true
         default: "all"
-        type: choice
-        options:
-          - all
-          - ozzit
-          - australian-tax-calculators
+        type: string
 
 permissions: {}
 
 jobs:
   resolve:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     outputs:
@@ -27,16 +24,26 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Compute build matrix
+      - name: Validate input and compute build matrix
         id: set-matrix
         env:
           INPUT_FORMULA: ${{ inputs.formula }}
         run: |
           python3 - <<'PY'
-          import json, os, pathlib
-          inp = os.environ["INPUT_FORMULA"]
-          formulae = sorted(p.stem for p in pathlib.Path("Formula").glob("*.rb")) if inp == "all" else [inp]
-          items = [{"formula": f, "os": os_name} for f in formulae for os_name in ["macos-latest", "ubuntu-latest"]]
+          import json, os, pathlib, sys
+          inp = os.environ["INPUT_FORMULA"].strip()
+          available = sorted(p.stem for p in pathlib.Path("Formula").glob("*.rb"))
+          if inp == "all":
+              formulae = available
+          elif inp in available:
+              formulae = [inp]
+          else:
+              sys.exit(f"unknown formula {inp!r}; expected 'all' or one of {available}")
+          items = [
+              {"formula": f, "os": os_name}
+              for f in formulae
+              for os_name in ["macos-latest", "ubuntu-latest", "ubuntu-24.04-arm"]
+          ]
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
               fh.write("matrix=" + json.dumps({"include": items}) + "\n")
           PY
@@ -49,7 +56,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -93,13 +100,15 @@ jobs:
     needs: [resolve, build]
     runs-on: ubuntu-latest
     permissions:
+      attestations: write
       contents: write
+      id-token: write
       pull-requests: write
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.TAP_PR_TOKEN || secrets.GITHUB_TOKEN }}
           persist-credentials: true
 
       - name: Configure Homebrew on Linux
@@ -112,15 +121,15 @@ jobs:
           echo "HOMEBREW_REPOSITORY=/home/linuxbrew/.linuxbrew/Homebrew" >> "$GITHUB_ENV"
 
       - name: Download all bottle artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: bottles-in
           pattern: bottle-*
           merge-multiple: true
 
-      - name: Upload bottle assets and merge bottle blocks
+      - name: Stage draft bottle releases and prepare formula update
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.TAP_PR_TOKEN || secrets.GITHUB_TOKEN }}
           INPUT_FORMULA: ${{ inputs.formula }}
         run: |
           set -euo pipefail
@@ -138,13 +147,17 @@ jobs:
             formulae="$INPUT_FORMULA"
           fi
 
+          mkdir -p attest-out
           for name in $formulae; do
             jsons=(bottles-in/"${name}"--*.bottle.json)
             [ -e "${jsons[0]}" ] || continue
             version="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(iter(d.values()))["formula"]["pkg_version"])' "${jsons[0]}")"
             tag="bottles-${name}-${version}"
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "Release $tag already exists (immutable releases cannot be mutated pre-merge)." >&2
+              exit 1
+            fi
 
-            # Stage assets using the exact remote filename Homebrew expects in each bottle JSON.
             mkdir -p "release-assets/${name}"
             python3 - "$name" "release-assets/${name}" "${jsons[@]}" <<'PY'
           import json, pathlib, shutil, sys
@@ -158,30 +171,42 @@ jobs:
                   dst = out / entry["filename"]
                   shutil.copy2(src, dst)
           PY
+            (cd "release-assets/${name}" && sha256sum * > SHA256SUMS)
+            cp "release-assets/${name}/"* attest-out/
 
-            if gh release view "$tag" >/dev/null 2>&1; then
-              gh release upload "$tag" "release-assets/${name}"/* --clobber
-            else
-              gh release create "$tag" "release-assets/${name}"/* \
-                --title "Bottles for ${name} ${version}" \
-                --notes "Prebuilt Homebrew bottles for ${name} ${version}."
-            fi
+            gh release create "$tag" "release-assets/${name}"/* \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "Bottles for ${name} ${version}" \
+              --notes "Prebuilt Homebrew bottles for ${name} ${version} (staged draft; published upon PR merge)."
 
             brew bottle --merge --write --no-commit --keep-old "${jsons[@]}"
           done
 
+      - name: Attest bottle provenance
+        if: ${{ hashFiles('attest-out/*.tar.gz') != '' }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: attest-out/*
+
+      - name: Open bottle update pull request
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          INPUT_FORMULA: ${{ inputs.formula }}
+        run: |
+          set -euo pipefail
           if git diff --quiet Formula/; then
             echo "No formula changes to commit."
             exit 0
           fi
-
-          branch="bottles/update-${GITHUB_RUN_ID}"
+          branch="ryan/bottles-${INPUT_FORMULA}-${GITHUB_RUN_ID}"
           git checkout -b "$branch"
           git add Formula/
           git commit -m "Update Homebrew bottles for ${INPUT_FORMULA}"
-          git push origin "$branch"
+          git push origin "refs/heads/${branch}"
           gh pr create \
             --base main \
             --head "$branch" \
+            --draft \
             --title "Update Homebrew bottles for ${INPUT_FORMULA}" \
-            --body "Adds prebuilt macOS and Linux Homebrew bottles built in workflow run ${GITHUB_RUN_ID}."
+            --body "Adds prebuilt macOS and Linux Homebrew bottles staged from workflow run ${GITHUB_RUN_ID}. Merging promotes the matching draft bottle release."
