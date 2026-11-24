@@ -36,6 +36,7 @@ jobs:
           persist-credentials: true
 
       - name: Update formula and open PR
+        id: update
         env:
           GH_TOKEN: ${{ secrets.TAP_PR_TOKEN || secrets.GITHUB_TOKEN }}
           FORMULA: ${{ inputs.formula }}
@@ -67,10 +68,19 @@ jobs:
           text, n_sha = re.subn(r'^  sha256 "[0-9a-f]{64}"$', f'  sha256 "{sha256}"', text, count=1, flags=re.M)
           if n_url != 1 or n_sha != 1:
               sys.exit(f"expected 1 url and 1 sha256 in {path}, got {n_url} and {n_sha}")
-          text = re.sub(r'\n  bottle do\n(?:.*\n)*?  end\n', '\n', text)
+          text = re.sub(r'\n  bottle do\n(?:.*\n)*?  end\n\n?', '\n', text)
           path.write_text(text, encoding="utf-8", newline="\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"formula={formula}\nversion={version}\n")
           PY
 
+      - name: Open version bump pull request
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          FORMULA: ${{ steps.update.outputs.formula }}
+          VERSION: ${{ steps.update.outputs.version }}
+        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           branch="ryan/bump-${FORMULA}-${VERSION}"

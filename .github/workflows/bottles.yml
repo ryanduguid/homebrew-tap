@@ -19,6 +19,9 @@ jobs:
       contents: read
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      has_work: ${{ steps.set-matrix.outputs.has_work }}
+      formula_arg: ${{ steps.set-matrix.outputs.formula_arg }}
+      formulae: ${{ steps.set-matrix.outputs.formulae }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -30,12 +33,20 @@ jobs:
           INPUT_FORMULA: ${{ inputs.formula }}
         run: |
           python3 - <<'PY'
-          import json, os, pathlib, sys
+          import json, os, pathlib, re, sys
           inp = os.environ["INPUT_FORMULA"].strip()
           available = sorted(p.stem for p in pathlib.Path("Formula").glob("*.rb"))
           if inp == "all":
-              formulae = available
-          elif inp in available:
+              formulae = [
+                  f
+                  for f in available
+                  if not re.search(
+                      r"^\s*bottle do\b",
+                      (pathlib.Path("Formula") / f"{f}.rb").read_text(encoding="utf-8"),
+                      re.M,
+                  )
+              ]
+          elif re.fullmatch(r"[a-z0-9-]+", inp) and inp in available:
               formulae = [inp]
           else:
               sys.exit(f"unknown formula {inp!r}; expected 'all' or one of {available}")
@@ -44,12 +55,17 @@ jobs:
               for f in formulae
               for os_name in ["macos-latest", "ubuntu-latest", "ubuntu-24.04-arm"]
           ]
+          has_work = "true" if items else "false"
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
               fh.write("matrix=" + json.dumps({"include": items}) + "\n")
+              fh.write(f"has_work={has_work}\n")
+              fh.write(f"formula_arg={inp}\n")
+              fh.write(f"formulae={' '.join(formulae)}\n")
           PY
 
   build:
     needs: resolve
+    if: ${{ needs.resolve.outputs.has_work == 'true' }}
     permissions:
       contents: read
     strategy:
@@ -66,11 +82,15 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
-          echo "/home/linuxbrew/.linuxbrew/sbin" >> "$GITHUB_PATH"
-          echo "HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew" >> "$GITHUB_ENV"
-          echo "HOMEBREW_CELLAR=/home/linuxbrew/.linuxbrew/Cellar" >> "$GITHUB_ENV"
-          echo "HOMEBREW_REPOSITORY=/home/linuxbrew/.linuxbrew/Homebrew" >> "$GITHUB_ENV"
+          {
+            echo "/home/linuxbrew/.linuxbrew/bin"
+            echo "/home/linuxbrew/.linuxbrew/sbin"
+          } >> "$GITHUB_PATH"
+          {
+            echo "HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew"
+            echo "HOMEBREW_CELLAR=/home/linuxbrew/.linuxbrew/Cellar"
+            echo "HOMEBREW_REPOSITORY=/home/linuxbrew/.linuxbrew/Homebrew"
+          } >> "$GITHUB_ENV"
 
       - name: Build and test bottle
         env:
@@ -98,6 +118,7 @@ jobs:
 
   publish:
     needs: [resolve, build]
+    if: ${{ needs.resolve.outputs.has_work == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       attestations: write
@@ -114,11 +135,15 @@ jobs:
       - name: Configure Homebrew on Linux
         run: |
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
-          echo "/home/linuxbrew/.linuxbrew/sbin" >> "$GITHUB_PATH"
-          echo "HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew" >> "$GITHUB_ENV"
-          echo "HOMEBREW_CELLAR=/home/linuxbrew/.linuxbrew/Cellar" >> "$GITHUB_ENV"
-          echo "HOMEBREW_REPOSITORY=/home/linuxbrew/.linuxbrew/Homebrew" >> "$GITHUB_ENV"
+          {
+            echo "/home/linuxbrew/.linuxbrew/bin"
+            echo "/home/linuxbrew/.linuxbrew/sbin"
+          } >> "$GITHUB_PATH"
+          {
+            echo "HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew"
+            echo "HOMEBREW_CELLAR=/home/linuxbrew/.linuxbrew/Cellar"
+            echo "HOMEBREW_REPOSITORY=/home/linuxbrew/.linuxbrew/Homebrew"
+          } >> "$GITHUB_ENV"
 
       - name: Download all bottle artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -130,7 +155,7 @@ jobs:
       - name: Stage draft bottle releases and prepare formula update
         env:
           GH_TOKEN: ${{ secrets.TAP_PR_TOKEN || secrets.GITHUB_TOKEN }}
-          INPUT_FORMULA: ${{ inputs.formula }}
+          FORMULAE: ${{ needs.resolve.outputs.formulae }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -141,28 +166,23 @@ jobs:
           ln -sfn "$GITHUB_WORKSPACE" "$tap_dir"
           brew trust ryanduguid/tap
 
-          if [ "$INPUT_FORMULA" = "all" ]; then
-            formulae="$(ls Formula/*.rb | xargs -n1 basename -s .rb)"
-          else
-            formulae="$INPUT_FORMULA"
-          fi
-
           mkdir -p attest-out
-          for name in $formulae; do
+          for name in $FORMULAE; do
             jsons=(bottles-in/"${name}"--*.bottle.json)
-            [ -e "${jsons[0]}" ] || continue
-            version="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(iter(d.values()))["formula"]["pkg_version"])' "${jsons[0]}")"
-            tag="bottles-${name}-${version}"
-            if gh release view "$tag" >/dev/null 2>&1; then
-              echo "Release $tag already exists (immutable releases cannot be mutated pre-merge)." >&2
+            if [ ! -e "${jsons[0]}" ]; then
+              echo "Missing downloaded bottle JSON metadata for ${name}" >&2
               exit 1
             fi
+            version="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(iter(d.values()))["formula"]["pkg_version"])' "${jsons[0]}")"
+            tag="bottles-${name}-${version}"
 
-            mkdir -p "release-assets/${name}"
-            python3 - "$name" "release-assets/${name}" "${jsons[@]}" <<'PY'
-          import json, pathlib, shutil, sys
-          name, out_dir, *json_paths = sys.argv[1:]
+            mkdir -p "release-assets/${name}" "attest-out/${name}"
+            python3 - "$name" "$tag" "$GITHUB_SHA" "release-assets/${name}" "attest-out/${name}" "${jsons[@]}" <<'PY'
+          import hashlib, json, pathlib, shutil, subprocess, sys
+
+          name, tag, target_sha, out_dir, attest_dir, *json_paths = sys.argv[1:]
           out = pathlib.Path(out_dir)
+          att = pathlib.Path(attest_dir)
           for jp in json_paths:
               data = json.load(open(jp, encoding="utf-8"))
               info = next(iter(data.values()))
@@ -170,29 +190,61 @@ jobs:
                   src = pathlib.Path(jp).parent / entry["local_filename"]
                   dst = out / entry["filename"]
                   shutil.copy2(src, dst)
-          PY
-            (cd "release-assets/${name}" && sha256sum * > SHA256SUMS)
-            cp "release-assets/${name}/"* attest-out/
 
-            gh release create "$tag" "release-assets/${name}"/* \
-              --draft \
-              --target "$GITHUB_SHA" \
-              --title "Bottles for ${name} ${version}" \
-              --notes "Prebuilt Homebrew bottles for ${name} ${version} (staged draft; published upon PR merge)."
+          checksum_lines = []
+          want_digests = {}
+          for fpath in sorted(p for p in out.iterdir() if p.is_file() and p.name != "SHA256SUMS"):
+              digest = hashlib.sha256(fpath.read_bytes()).hexdigest()
+              checksum_lines.append(f"{digest}  {fpath.name}\n")
+              want_digests[fpath.name] = digest
+          sums_path = out / "SHA256SUMS"
+          sums_path.write_text("".join(checksum_lines), encoding="utf-8", newline="\n")
+          want_digests["SHA256SUMS"] = hashlib.sha256(sums_path.read_bytes()).hexdigest()
+
+          for fpath in sorted(out.iterdir()):
+              shutil.copy2(fpath, att / fpath.name)
+
+          r = subprocess.run(["gh", "release", "view", tag, "--json", "isDraft,assets"], check=False, text=True, capture_output=True)
+          if r.returncode != 0:
+              err = (r.stderr or r.stdout or "").lower()
+              if "release not found" not in err:
+                  raise SystemExit(f"{tag}: release lookup failed: {(r.stderr or r.stdout).strip()}")
+              version = tag.removeprefix(f"bottles-{name}-")
+              subprocess.check_call([
+                  "gh", "release", "create", tag,
+                  *(str(p) for p in sorted(out.iterdir())),
+                  "--draft",
+                  "--target", target_sha,
+                  "--title", f"Bottles for {name} {version}",
+                  "--notes", f"Prebuilt Homebrew bottles for {name} {version} (staged draft; published upon PR merge).",
+              ])
+          else:
+              rel = json.loads(r.stdout)
+              if not rel.get("isDraft"):
+                  raise SystemExit(f"Release {tag} is already published (immutable releases cannot be mutated).")
+              got_digests = {
+                  a["name"]: (a.get("digest") or "").removeprefix("sha256:")
+                  for a in rel.get("assets", [])
+                  if a.get("state") == "uploaded"
+              }
+              if got_digests != want_digests:
+                  raise SystemExit(f"Existing draft release {tag} assets/digests do not match this build; delete the stale draft before rerunning.")
+              print(f"Reusing matching intact draft release {tag}")
+          PY
 
             brew bottle --merge --write --no-commit --keep-old "${jsons[@]}"
           done
 
       - name: Attest bottle provenance
-        if: ${{ hashFiles('attest-out/*.tar.gz') != '' }}
+        if: ${{ hashFiles('attest-out/*/*.tar.gz') != '' }}
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: attest-out/*
+          subject-path: attest-out/*/*
 
       - name: Open bottle update pull request
         env:
           GH_TOKEN: ${{ secrets.TAP_PR_TOKEN || secrets.GITHUB_TOKEN }}
-          INPUT_FORMULA: ${{ inputs.formula }}
+          INPUT_FORMULA: ${{ needs.resolve.outputs.formula_arg }}
         run: |
           set -euo pipefail
           if git diff --quiet Formula/; then
