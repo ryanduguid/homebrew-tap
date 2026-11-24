@@ -13,13 +13,13 @@ on:
           - ozzit
           - australian-tax-calculators
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 jobs:
   resolve:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
@@ -43,6 +43,8 @@ jobs:
 
   build:
     needs: resolve
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
@@ -90,11 +92,15 @@ jobs:
   publish:
     needs: [resolve, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
 
       - name: Configure Homebrew on Linux
         run: |
