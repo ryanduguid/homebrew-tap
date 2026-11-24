@@ -16,7 +16,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -37,14 +37,15 @@ jobs:
           brew tap ryanduguid/tap "$GITHUB_WORKSPACE"
           brew trust ryanduguid/tap
 
-      - name: Audit formula
+      - name: Audit, install and test every formula
         run: |
-          brew audit --strict --formula ryanduguid/tap/ozzit
-
-      - name: Install from source
-        run: |
-          brew install --verbose --build-from-source ryanduguid/tap/ozzit
-
-      - name: Test installed formula
-        run: |
-          brew test ryanduguid/tap/ozzit
+          set -euo pipefail
+          for f in Formula/*.rb; do
+            name="$(basename "$f" .rb)"
+            echo "=== Auditing $name ==="
+            brew audit --strict --formula "ryanduguid/tap/$name"
+            echo "=== Installing $name ==="
+            brew install --verbose "ryanduguid/tap/$name"
+            echo "=== Testing $name ==="
+            brew test "ryanduguid/tap/$name"
+          done

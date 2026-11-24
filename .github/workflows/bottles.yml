@@ -1,0 +1,181 @@
+name: Build and publish Homebrew bottles
+
+on:
+  workflow_dispatch:
+    inputs:
+      formula:
+        description: "Formula name to bottle (ozzit, australian-tax-calculators or all)"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - ozzit
+          - australian-tax-calculators
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compute build matrix
+        id: set-matrix
+        env:
+          INPUT_FORMULA: ${{ inputs.formula }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          inp = os.environ["INPUT_FORMULA"]
+          formulae = sorted(p.stem for p in pathlib.Path("Formula").glob("*.rb")) if inp == "all" else [inp]
+          items = [{"formula": f, "os": os_name} for f in formulae for os_name in ["macos-latest", "ubuntu-latest"]]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("matrix=" + json.dumps({"include": items}) + "\n")
+          PY
+
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure Homebrew on Linux
+        if: runner.os == 'Linux'
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+          echo "/home/linuxbrew/.linuxbrew/sbin" >> "$GITHUB_PATH"
+          echo "HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew" >> "$GITHUB_ENV"
+          echo "HOMEBREW_CELLAR=/home/linuxbrew/.linuxbrew/Cellar" >> "$GITHUB_ENV"
+          echo "HOMEBREW_REPOSITORY=/home/linuxbrew/.linuxbrew/Homebrew" >> "$GITHUB_ENV"
+
+      - name: Build and test bottle
+        env:
+          FORMULA: ${{ matrix.formula }}
+        run: |
+          set -euo pipefail
+          brew tap ryanduguid/tap "$GITHUB_WORKSPACE"
+          brew trust ryanduguid/tap
+          version="$(brew info --json=v2 "ryanduguid/tap/$FORMULA" | python3 -c 'import json,sys; print(json.load(sys.stdin)["formulae"][0]["versions"]["stable"])')"
+          tag="bottles-${FORMULA}-${version}"
+          root_url="https://github.com/ryanduguid/homebrew-tap/releases/download/${tag}"
+          mkdir -p bottle-out
+          cd bottle-out
+          brew install --verbose --build-bottle "ryanduguid/tap/$FORMULA"
+          brew test "ryanduguid/tap/$FORMULA"
+          brew bottle --no-rebuild --json --root-url="$root_url" "ryanduguid/tap/$FORMULA"
+          ls -la
+
+      - name: Upload bottle artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bottle-${{ matrix.formula }}-${{ matrix.os }}
+          path: bottle-out/*
+          if-no-files-found: error
+
+  publish:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Homebrew on Linux
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+          echo "/home/linuxbrew/.linuxbrew/sbin" >> "$GITHUB_PATH"
+          echo "HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew" >> "$GITHUB_ENV"
+          echo "HOMEBREW_CELLAR=/home/linuxbrew/.linuxbrew/Cellar" >> "$GITHUB_ENV"
+          echo "HOMEBREW_REPOSITORY=/home/linuxbrew/.linuxbrew/Homebrew" >> "$GITHUB_ENV"
+
+      - name: Download all bottle artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: bottles-in
+          pattern: bottle-*
+          merge-multiple: true
+
+      - name: Upload bottle assets and merge bottle blocks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_FORMULA: ${{ inputs.formula }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          tap_dir="$(brew --repository)/Library/Taps/ryanduguid/homebrew-tap"
+          mkdir -p "$(dirname "$tap_dir")"
+          ln -sfn "$GITHUB_WORKSPACE" "$tap_dir"
+          brew trust ryanduguid/tap
+
+          if [ "$INPUT_FORMULA" = "all" ]; then
+            formulae="$(ls Formula/*.rb | xargs -n1 basename -s .rb)"
+          else
+            formulae="$INPUT_FORMULA"
+          fi
+
+          for name in $formulae; do
+            jsons=(bottles-in/"${name}"--*.bottle.json)
+            [ -e "${jsons[0]}" ] || continue
+            version="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(iter(d.values()))["formula"]["pkg_version"])' "${jsons[0]}")"
+            tag="bottles-${name}-${version}"
+
+            # Stage assets using the exact remote filename Homebrew expects in each bottle JSON.
+            mkdir -p "release-assets/${name}"
+            python3 - "$name" "release-assets/${name}" "${jsons[@]}" <<'PY'
+          import json, pathlib, shutil, sys
+          name, out_dir, *json_paths = sys.argv[1:]
+          out = pathlib.Path(out_dir)
+          for jp in json_paths:
+              data = json.load(open(jp, encoding="utf-8"))
+              info = next(iter(data.values()))
+              for _os_tag, entry in info["bottle"]["tags"].items():
+                  src = pathlib.Path(jp).parent / entry["local_filename"]
+                  dst = out / entry["filename"]
+                  shutil.copy2(src, dst)
+          PY
+
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release upload "$tag" "release-assets/${name}"/* --clobber
+            else
+              gh release create "$tag" "release-assets/${name}"/* \
+                --title "Bottles for ${name} ${version}" \
+                --notes "Prebuilt Homebrew bottles for ${name} ${version}."
+            fi
+
+            brew bottle --merge --write --no-commit --keep-old "${jsons[@]}"
+          done
+
+          if git diff --quiet Formula/; then
+            echo "No formula changes to commit."
+            exit 0
+          fi
+
+          branch="bottles/update-${GITHUB_RUN_ID}"
+          git checkout -b "$branch"
+          git add Formula/
+          git commit -m "Update Homebrew bottles for ${INPUT_FORMULA}"
+          git push origin "$branch"
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "Update Homebrew bottles for ${INPUT_FORMULA}" \
+            --body "Adds prebuilt macOS and Linux Homebrew bottles built in workflow run ${GITHUB_RUN_ID}."
