@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test-formulae:
     strategy:
@@ -16,36 +20,104 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Configure Homebrew on Linux
         if: runner.os == 'Linux'
         run: |
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
-          echo "/home/linuxbrew/.linuxbrew/sbin" >> "$GITHUB_PATH"
-          echo "HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew" >> "$GITHUB_ENV"
-          echo "HOMEBREW_CELLAR=/home/linuxbrew/.linuxbrew/Cellar" >> "$GITHUB_ENV"
-          echo "HOMEBREW_REPOSITORY=/home/linuxbrew/.linuxbrew/Homebrew" >> "$GITHUB_ENV"
+          {
+            echo "/home/linuxbrew/.linuxbrew/bin"
+            echo "/home/linuxbrew/.linuxbrew/sbin"
+          } >> "$GITHUB_PATH"
+          {
+            echo "HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew"
+            echo "HOMEBREW_CELLAR=/home/linuxbrew/.linuxbrew/Cellar"
+            echo "HOMEBREW_REPOSITORY=/home/linuxbrew/.linuxbrew/Homebrew"
+          } >> "$GITHUB_ENV"
 
       - name: Tap local checkout
         run: |
           brew tap ryanduguid/tap "$GITHUB_WORKSPACE"
           brew trust ryanduguid/tap
 
-      - name: Audit, install and test every formula
+      - name: Audit, install and test changed or all formulae
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          for f in Formula/*.rb; do
-            name="$(basename "$f" .rb)"
+          formulae=()
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$BASE_SHA" ]; then
+            git fetch --no-tags --depth=1 origin "$BASE_SHA" || git fetch --no-tags --unshallow origin
+            if git diff --quiet "$BASE_SHA" HEAD -- .github/workflows/ci.yml; then
+              while IFS= read -r path; do
+                [ -f "$path" ] && formulae+=("$(basename "$path" .rb)")
+              done < <(git diff --name-only "$BASE_SHA" HEAD -- 'Formula/*.rb')
+            fi
+          fi
+          if [ "${#formulae[@]}" -eq 0 ]; then
+            for f in Formula/*.rb; do
+              formulae+=("$(basename "$f" .rb)")
+            done
+          fi
+          for name in "${formulae[@]}"; do
             echo "=== Auditing $name ==="
             brew audit --strict --formula "ryanduguid/tap/$name"
-            echo "=== Installing $name ==="
-            brew install --verbose "ryanduguid/tap/$name"
+            install_flags=(--verbose)
+            need_source=true
+            if grep -qE '^[[:space:]]*bottle do$' "Formula/${name}.rb"; then
+              bottle_info="$(brew info --json=v2 "ryanduguid/tap/$name")"
+              bottle_urls="$(BOTTLE_INFO="$bottle_info" python3 - <<'PY'
+          import json, os, platform
+          d = json.loads(os.environ["BOTTLE_INFO"])["formulae"][0]
+          files = d.get("bottle", {}).get("stable", {}).get("files", {})
+          sysname = platform.system()
+          arch = platform.machine().lower()
+          def compat(tag):
+              if tag == "all":
+                  return True
+              if sysname == "Linux":
+                  return tag == ("arm64_linux" if arch in ("arm64", "aarch64") else "x86_64_linux")
+              if sysname == "Darwin":
+                  if tag.endswith("_linux"):
+                      return False
+                  if arch in ("arm64", "aarch64"):
+                      return tag.startswith("arm64_")
+                  return not tag.startswith("arm64_")
+              return True
+          for k, v in files.items():
+              if compat(k) and v.get("url"):
+                  print(v["url"])
+          PY
+          )"
+              if [ -n "$bottle_urls" ]; then
+                need_source=false
+                while IFS= read -r b_url; do
+                  [ -n "$b_url" ] || continue
+                  code="$(curl -sS -L -r 0-0 -o /dev/null -w '%{http_code}' --retry 2 --retry-delay 1 --max-time 15 "$b_url" || true)"
+                  if [ "$code" = "200" ] || [ "$code" = "206" ]; then
+                    continue
+                  elif [ "$code" = "404" ] || [ "$code" = "410" ]; then
+                    need_source=true
+                    break
+                  else
+                    echo "Unexpected HTTP ${code:-000} probing bottle URL $b_url" >&2
+                    exit 1
+                  fi
+                done <<< "$bottle_urls"
+              fi
+            fi
+            if [ "$need_source" = "true" ]; then
+              install_flags+=(--build-from-source)
+            fi
+            echo "=== Installing $name (${install_flags[*]}) ==="
+            brew install "${install_flags[@]}" "ryanduguid/tap/$name"
             echo "=== Testing $name ==="
             brew test "ryanduguid/tap/$name"
           done
