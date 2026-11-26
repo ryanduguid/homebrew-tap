@@ -14,7 +14,8 @@ class AustralianTaxCalculators < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/australian-tax-calculators --version")
-    help = shell_output("#{bin}/australian-tax-calculators --api-help")
-    assert_match "gst", help
+    facts = { scope_confirmed: true, year: "2025-26", amount: "1100", gst_inclusive: true }.to_json
+    result = JSON.parse(pipe_output("#{bin}/australian-tax-calculators gst", facts, 0))
+    assert_equal "100.00", result.dig("amounts", "gst")
   end
 end

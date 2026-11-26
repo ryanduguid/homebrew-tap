@@ -7,6 +7,7 @@ class AusAccountingMcp < Formula
   sha256 "a2de86d0cfa5b240e4f931d1c2b4317c3d4d5cfbb23050ff4c009c2979d6002e"
   license "AGPL-3.0-or-later"
 
+  depends_on "australian-tax-calculators" => :build
   depends_on "cryptography" => :no_linkage
   depends_on "pydantic" => :no_linkage
   depends_on "python@3.15"
@@ -136,11 +137,19 @@ class AusAccountingMcp < Formula
 
   def install
     virtualenv_install_with_resources
+    # The server runs only a released calculators executable or one whose SHA-256 is
+    # named, so keep a private copy of the brewed one and name that copy's digest.
+    calculators = libexec/"australian-tax-calculators"
+    cp Formula["australian-tax-calculators"].opt_bin/calculators.basename, calculators
+    env = { AUS_TAX_CALCULATORS_BIN: calculators, AUS_TAX_CALCULATORS_SHA256: calculators.sha256 }
+    bin.children.each do |script|
+      script.unlink
+      script.write_env_script libexec/"bin"/script.basename, env
+    end
   end
 
   test do
-    assert_match version.to_s, shell_output("#{bin}/aus-accounting-mcp --version")
-    request = {
+    start = {
       jsonrpc: "2.0",
       id:      1,
       method:  "initialize",
@@ -149,9 +158,18 @@ class AusAccountingMcp < Formula
         capabilities:    {},
         clientInfo:      { name: "brew-test", version: "1" },
       },
-    }.to_json
-    output = pipe_output(bin/"aus-accounting-mcp", "#{request}\n", 0)
-    assert_match "\"name\":\"aus-accounting-mcp\"", output
-    assert_match "\"version\":\"#{version}\"", output
+    }
+    facts = { kind: "gst", year: "2025-26", scope_confirmed: true, amount: "1100", gst_inclusive: true }
+    worksheet = {
+      jsonrpc: "2.0",
+      id:      2,
+      method:  "tools/call",
+      params:  { name: "calculate_tax_worksheet", arguments: { facts: } },
+    }
+    messages = [start, { jsonrpc: "2.0", method: "notifications/initialized" }, worksheet]
+    output = pipe_output(bin/"aus-accounting-mcp", messages.map { |message| "#{message.to_json}\n" }.join, 0)
+    replies = output.lines.map { |line| JSON.parse(line) }.to_h { |reply| [reply["id"], reply] }
+    assert_equal version.to_s, replies.dig(1, "result", "serverInfo", "version")
+    assert_equal "100.00", replies.dig(2, "result", "structuredContent", "amounts", "gst"), output
   end
 end
