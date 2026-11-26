@@ -140,7 +140,7 @@ class AusAccountingMcp < Formula
     # The server runs only a released calculators executable or one whose SHA-256 is
     # named, so keep a private copy of the brewed one and name that copy's digest.
     calculators = libexec/"australian-tax-calculators"
-    cp Formula["australian-tax-calculators"].opt_bin/calculators.basename, calculators
+    cp formula_opt_bin("australian-tax-calculators")/calculators.basename, calculators
     env = { AUS_TAX_CALCULATORS_BIN: calculators, AUS_TAX_CALCULATORS_SHA256: calculators.sha256 }
     bin.children.each do |script|
       script.unlink
