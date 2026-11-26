@@ -167,9 +167,21 @@ class AusAccountingMcp < Formula
       params:  { name: "calculate_tax_worksheet", arguments: { facts: } },
     }
     messages = [start, { jsonrpc: "2.0", method: "notifications/initialized" }, worksheet]
-    output = pipe_output(bin/"aus-accounting-mcp", messages.map { |message| "#{message.to_json}\n" }.join, 0)
-    replies = output.lines.map { |line| JSON.parse(line) }.to_h { |reply| [reply["id"], reply] }
-    assert_equal version.to_s, replies.dig(1, "result", "serverInfo", "version")
-    assert_equal "100.00", replies.dig(2, "result", "structuredContent", "amounts", "gst"), output
+    # Wait for each reply before the next request: the server drops a call still
+    # running when its input closes.
+    started, calculated = IO.popen((bin/"aus-accounting-mcp").to_s, "r+") do |server|
+      messages.filter_map do |message|
+        server.puts message.to_json
+        server.flush
+        next unless message[:id]
+
+        loop do
+          reply = JSON.parse(server.gets)
+          break reply if reply["id"] == message[:id]
+        end
+      end
+    end
+    assert_equal version.to_s, started.dig("result", "serverInfo", "version")
+    assert_equal "100.00", calculated.dig("result", "structuredContent", "amounts", "gst"), calculated.to_json
   end
 end
