@@ -59,6 +59,13 @@ jobs:
               while IFS= read -r path; do
                 [ -f "$path" ] && formulae+=("$(basename "$path" .rb)")
               done < <(git diff --name-only "$BASE_SHA" HEAD -- 'Formula/*.rb')
+              # Retest each formula that depends on a changed one.
+              for name in "${formulae[@]}"; do
+                for path in $(grep -l "depends_on \"$name\"" Formula/*.rb); do
+                  dependent="$(basename "$path" .rb)"
+                  [[ " ${formulae[*]} " == *" $dependent "* ]] || formulae+=("$dependent")
+                done
+              done
             fi
           fi
           if [ "${#formulae[@]}" -eq 0 ]; then
